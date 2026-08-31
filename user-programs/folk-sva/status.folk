@@ -1,0 +1,251 @@
+# http://folk-sva:4273/status
+#
+# What hardware this node actually has, at three levels, because they
+# disagree more often than you would think:
+#
+#   physical  what the kernel sees on USB / Bluetooth right now
+#   CUPS      what the print system believes it has
+#   Folk      what has made it into the statement database
+#
+# Every bug we have chased on this box lived in a gap between two of
+# those columns: a CUPS queue pointing at a printer that moved, and a
+# USB printer CUPS acknowledged jobs for but never delivered to. So the
+# page shows all three side by side rather than one summary verdict.
+
+Wish the web server handles route "/status" with nav "<button>Status</button>" handler {
+    proc esc {s} {
+        string map {& "&amp;" < "&lt;" > "&gt;" "\"" "&quot;"} $s
+    }
+    proc slurp {path} {
+        if {[catch {set fp [open $path r]} err]} { return "" }
+        set d [read $fp]
+        close $fp
+        return [string trim $d]
+    }
+    proc runOrEmpty {args} {
+        if {[catch {exec {*}$args} out]} { return "" }
+        return $out
+    }
+    proc yn {ok yes no} {
+        if {$ok} {
+            return "<span class=ok>$yes</span>"
+        }
+        return "<span class=bad>$no</span>"
+    }
+
+    # ---- USB inventory, grouped by interface class -------------------
+    # A device is listed once per interface it exposes; a webcam shows
+    # up under Cameras via its video interface even though the same
+    # physical device also exposes audio.
+    set classNames [dict create \
+        01 Audio 02 Comms 03 {Keyboards & HID} 05 Physical 06 Imaging \
+        07 Printers 08 {Mass storage} 09 Hubs 0a {CDC data} 0b {Smart card} \
+        0e Cameras e0 {Wireless (BT/radio)} ef Misc fe {App specific} \
+        ff {Vendor specific}]
+    set buckets [dict create]
+    foreach f [glob -nocomplain /sys/bus/usb/devices/*/bInterfaceClass] {
+        set cls [string tolower [slurp $f]]
+        if {$cls eq ""} { continue }
+        set ifdir [file dirname $f]
+        set parent [lindex [split [file tail $ifdir] ":"] 0]
+        set pdir /sys/bus/usb/devices/$parent
+        if {![file isdirectory $pdir] && [regexp {^([0-9]+)-0$} $parent -> bus]} {
+            # A root hub's interface is named N-0:1.0 but the device
+            # itself is usbN, so the naive parent path does not exist.
+            set pdir /sys/bus/usb/devices/usb$bus
+        }
+        set vid [slurp $pdir/idVendor]
+        set pid [slurp $pdir/idProduct]
+        set mfr [slurp $pdir/manufacturer]
+        set prod [slurp $pdir/product]
+        set label [string trim "$mfr $prod"]
+        if {$label eq ""} { set label "(unnamed device)" }
+        dict lappend buckets $cls \
+            [list $label $vid:$pid [file tail $ifdir]]
+    }
+
+    # ---- Folk's own view ---------------------------------------------
+    set folkCameras [list]
+    catch {
+        foreach r [Query! $::thisNode has camera /camera/ with /...info/] {
+            lappend folkCameras [dict get $r camera]
+        }
+    }
+    set folkKeyboards [list]
+    catch {
+        foreach r [Query! /keyboard/ is a keyboard device] {
+            lappend folkKeyboards [dict get $r keyboard]
+        }
+    }
+    set folkDefaultPrinter ""
+    catch {set folkDefaultPrinter [QueryOne! printer /./ is the default printer]}
+    set folkStripPrinters [list]
+    catch {
+        foreach r [Query! printer /p/ is a thermal strip printer] {
+            lappend folkStripPrinters [dict get $r p]
+        }
+    }
+
+    # ---- Nightly print health ----------------------------------------
+    set health [dict create]
+    catch {set health [slurp $::env(HOME)/folk-data/printer-health.txt]}
+    if {[catch {dict size $health}]} { set health [dict create] }
+
+    # ---- Network ------------------------------------------------------
+    set iface [string trim [runOrEmpty sh -c {ip -4 route show default | awk '{print $5; exit}'}]]
+    set ipcidr [string trim [runOrEmpty sh -c "ip -4 -o addr show dev $iface | awk '{print \$4; exit}'"]]
+    set gw [string trim [runOrEmpty sh -c {ip -4 route show default | awk '{print $3; exit}'}]]
+    set ssid [string trim [runOrEmpty sh -c "iw dev $iface link | sed -n 's/^\\tSSID: //p'"]]
+
+    # ---- Bluetooth ----------------------------------------------------
+    set btAdapters [glob -nocomplain -tails -directory /sys/class/bluetooth *]
+    set btService [string trim [runOrEmpty systemctl is-active bluetooth]]
+    if {$btService eq ""} { set btService inactive }
+
+    # ---- CUPS ---------------------------------------------------------
+    set usbPrinterPresent [expr {[dict exists $buckets 07]}]
+    set cupsRows [list]
+    foreach line [split [runOrEmpty lpstat -v] "\n"] {
+        if {![regexp {^device for ([^:]+): (.*)$} $line -> name uri]} { continue }
+        set reach 0
+        set how "unknown transport"
+        if {[string match "usb://*" $uri]} {
+            set reach $usbPrinterPresent
+            set how "USB (kernel printer-class interface)"
+        } elseif {[regexp {ipps?://([0-9.]+)} $uri -> ip]} {
+            set reach [expr {![catch {
+                exec timeout 2 bash -c "exec 3<>/dev/tcp/$ip/631"
+            }]}]
+            set how "network (IPP port 631 at $ip)"
+        }
+        set state [string trim [runOrEmpty sh -c "lpstat -p [list $name] | head -1"]]
+        lappend cupsRows [list $name $uri $reach $how $state]
+    }
+
+    # ---- Render --------------------------------------------------------
+    set out {<!doctype html><meta name=viewport content="width=device-width,initial-scale=1"><title>folk-sva status</title>}
+    append out {<style>
+      body { font-family: system-ui, sans-serif; margin: 0 auto; padding: 1rem;
+             max-width: 60rem; line-height: 1.45; }
+      h1 { font-size: 1.4rem; margin-bottom: 0; }
+      h2 { font-size: 1.05rem; margin: 1.6rem 0 .4rem; border-bottom: 1px solid #ccc; }
+      table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+      td, th { text-align: left; padding: .25rem .5rem; vertical-align: top;
+               border-bottom: 1px solid #eee; }
+      th { font-weight: 600; }
+      code { font-family: ui-monospace, monospace; font-size: .85em; word-break: break-all; }
+      .ok { color: #197a3d; font-weight: 600; }
+      .bad { color: #b3261e; font-weight: 600; }
+      .muted { color: #666; }
+      .banner { padding: .6rem .8rem; border-radius: .4rem; margin-top: .6rem; }
+      .banner.ok { background: #e7f5ec; }
+      .banner.bad { background: #fdecea; }
+      .banner.partial { background: #fff4e5; color: #8a5300; }
+    </style>}
+
+    append out "<h1>folk-sva status</h1>"
+    append out "<p class=muted>Generated [clock format [clock seconds] -format {%a, %d %b %Y, %r %Z}]</p>"
+
+    # Nightly print check
+    append out "<h2>Nightly print check</h2>"
+    if {[dict size $health] == 0} {
+        append out "<p class=muted>No check has run yet. It runs at 01:00 from folk's crontab; \
+                    run <code>user-programs/folk-sva/printer-healthcheck.sh</code> to populate this now.</p>"
+    } else {
+        set overall [dict getdef $health overall unknown]
+        set cls [expr {$overall eq "ok" ? "ok" : ($overall eq "partial" ? "partial" : "bad")}]
+        append out "<div class=\"banner $cls\">Last run [esc [dict getdef $health timestamp ?]] &mdash; <b>[esc $overall]</b></div>"
+        append out "<table><tr><th>Path<th>Result<th>Detail</tr>"
+        append out "<tr><td>WiFi &middot; [esc [dict getdef $health wifi_printer ?]]<td>[yn [dict getdef $health wifi_ok 0] connected unreachable]<td>[esc [dict getdef $health wifi_detail {}]]</tr>"
+        append out "<tr><td>USB &middot; receipt<td>[yn [dict getdef $health usb_ok 0] connected unreachable]<td>[esc [dict getdef $health usb_detail {}]]</tr>"
+        append out "</table>"
+        append out "<p class=muted>Checked from SSID [esc [dict getdef $health ssid ?]] at [esc [dict getdef $health ipcidr ?]]. \
+                    Neither check prints anything.</p>"
+    }
+
+    # Network
+    append out "<h2>Network</h2><table>"
+    append out "<tr><th>Interface<td><code>[esc $iface]</code></tr>"
+    append out "<tr><th>Address<td><code>[esc $ipcidr]</code></tr>"
+    append out "<tr><th>Gateway<td><code>[esc $gw]</code></tr>"
+    append out "<tr><th>SSID<td>[esc $ssid]</tr>"
+    append out "</table>"
+
+    # Printers
+    append out "<h2>Printers (CUPS vs. physical)</h2>"
+    if {[llength $cupsRows] == 0} {
+        append out "<p class=muted>No CUPS queues.</p>"
+    } else {
+        append out "<table><tr><th>Queue<th>Reachable<th>How we checked<th>Device URI<th>CUPS says</tr>"
+        foreach row $cupsRows {
+            lassign $row name uri reach how state
+            append out "<tr><td><b>[esc $name]</b><td>[yn $reach yes no]<td class=muted>[esc $how]<td><code>[esc $uri]</code><td class=muted>[esc $state]</tr>"
+        }
+        append out "</table>"
+        append out "<p class=muted>\"CUPS says\" is not evidence of delivery: this printer's queue reports \
+                    idle, and its usb backend acknowledges jobs, whether or not anything reaches paper. \
+                    The Reachable column tests the device.</p>"
+    }
+
+    # USB
+    append out "<h2>USB devices (kernel)</h2>"
+    if {[dict size $buckets] == 0} {
+        append out "<p class=muted>No USB interfaces found.</p>"
+    } else {
+        append out "<table><tr><th>Class<th>Device<th>ID<th>Interface</tr>"
+        foreach cls [lsort [dict keys $buckets]] {
+            set label [dict getdef $classNames $cls "Class $cls"]
+            foreach d [dict get $buckets $cls] {
+                lassign $d name id ifc
+                append out "<tr><td>[esc $label]<td>[esc $name]<td><code>[esc $id]</code><td class=muted><code>[esc $ifc]</code></tr>"
+            }
+        }
+        append out "</table>"
+    }
+
+    # Bluetooth
+    append out "<h2>Bluetooth</h2>"
+    if {[llength $btAdapters] == 0} {
+        append out "<p>[yn 0 {} {No adapter}] &mdash; no Bluetooth hardware on this node.</p>"
+    } else {
+        append out "<p>Adapter <code>[esc [join $btAdapters {, }]]</code> present; \
+                    <code>bluetooth.service</code> is <b>[esc $btService]</b>.</p>"
+        if {$btService ne "active"} {
+            append out "<p class=muted>The stack is down, so no paired or nearby devices can be \
+                        enumerated and nothing is reaching Folk over Bluetooth. This is a \
+                        statement about the service, not about the hardware.</p>"
+        }
+    }
+
+    # Folk's view
+    append out "<h2>Available to Folk</h2><table>"
+    append out "<tr><th>Cameras<td>"
+    if {[llength $folkCameras] == 0} {
+        append out "<span class=bad>none claimed</span>"
+    } else {
+        foreach c $folkCameras { append out "<code>[esc $c]</code><br>" }
+    }
+    append out "</tr><tr><th>Keyboards<td>"
+    if {[llength $folkKeyboards] == 0} {
+        append out "<span class=bad>none claimed</span>"
+    } else {
+        foreach k $folkKeyboards { append out "<code>[esc $k]</code><br>" }
+    }
+    append out "</tr><tr><th>Default printer<td>"
+    if {$folkDefaultPrinter eq ""} {
+        append out "<span class=bad>none</span>"
+    } else {
+        append out "[esc $folkDefaultPrinter]"
+    }
+    append out "</tr><tr><th>Strip printers<td>"
+    if {[llength $folkStripPrinters] == 0} {
+        append out "<span class=muted>none</span>"
+    } else {
+        append out "[esc [join $folkStripPrinters {, }]]"
+    }
+    append out "</tr></table>"
+    append out "<p class=muted>A device can be present on USB and still be missing here \
+                if the program that claims it is not running.</p>"
+
+    html $out
+}
