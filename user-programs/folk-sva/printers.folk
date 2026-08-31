@@ -1,0 +1,17 @@
+# Printers on folk-sva.
+#
+# The Canon PIXMA lives on SVA's DHCP and its address moves; the cron
+# job ~/bin/repair-printer.sh re-points the CUPS queue at it every 10
+# minutes (SVA's WLAN blocks mDNS, so it has to be found by scanning).
+#
+# When the Canon is off the network entirely, print/print.folk falls
+# back to the thermal strip printer instead of queueing a sheet that
+# will never come out. See print/strip.folk.
+
+Claim printer Pixma is the default printer
+Claim paper format letter is the default paper format
+
+# Deliberately NOT "is a receipt printer": that predicate routes to
+# esc-pos.folk, which expects a networked printer on port 9100. This
+# one is USB, driven through CUPS as a raw queue.
+Claim printer ThermalPrinter is a thermal strip printer

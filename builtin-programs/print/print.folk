@@ -13,6 +13,7 @@
 Claim the paper formats are {
     letter    {tagInnerSideLength 70 pageSize {612 792}}
     a4        {tagInnerSideLength 70 pageSize {595 842}}
+    a5        {tagInnerSideLength 70 pageSize {420 595}}
     indexcard {tagInnerSideLength 70 pageSize {612 792}}
 }
 
@@ -210,6 +211,16 @@ fn nextId {} {
 
     set id
 }
+fn printerIsReachable {printerName} {
+    # A CUPS queue reports "idle" whether or not the printer is actually
+    # on the network, so ask the device itself. The URI holds a literal
+    # IP (SVA's WLAN blocks mDNS), so a bounded TCP connect to the IPP
+    # port is the cheapest true liveness test we have.
+    if {[catch {exec lpstat -v $printerName} out]} { return 0 }
+    if {![regexp {ipps?://([0-9.]+)} $out -> ip]} { return 0 }
+    expr {![catch {exec timeout 2 bash -c "exec 3<>/dev/tcp/$ip/631"}]}
+}
+
 When $::thisNode claims printer /name/ is a cups printer with /...options/ {
     set command [list /usr/sbin/lpadmin -p $name -E]
     if {[dict exists $options url]} {
@@ -248,6 +259,26 @@ Subscribe: print code /code/ with mixins /mixins/ {
 Subscribe: print code /code/ {
     Notify: print code $code with mixins {}
 }
+# The /new picker names a printer explicitly; that choice wins over both
+# the default printer and the availability fallback.
+Subscribe: print code /code/ with mixins /mixins/ on printer /printerName/ {
+    Require! the paper formats are /formats/
+    set formatName [QueryOne! paper format /./ is the default paper format \
+                       -default letter]
+    set fmt $formats($formatName)
+
+    set mToPt 2834.646
+    set textScale 0.003
+    set margin {0.01 0.005 0.005 0.01}
+    set options [dict merge $fmt [dict create \
+        code $code \
+        printer $printerName \
+        lineHeight [* $textScale $mToPt] \
+        advance [* 0.5859375 $textScale $mToPt] \
+        margin [lmap x $margin {* $x $mToPt}] \
+        mixins $mixins]]
+    Notify: print a new program with {*}$options
+}
 
 Subscribe: print a new program with /...options/ {
     if {$::thisNode eq "folk-beads" || $::thisNode eq "folk-convivial"} {
@@ -264,10 +295,35 @@ Subscribe: print a new program with /...options/ {
 Subscribe: print program /id/ with /...options/ {
     set code [dict get $options code]
 
+    # An explicitly chosen strip printer short-circuits the paged
+    # pipeline entirely -- a strip is rendered, not a sheet.
+    set explicitPrinter ""
+    if {[dict exists $options printer]} {
+        set explicitPrinter [dict get $options printer]
+    }
+    if {$explicitPrinter ne "" && \
+        [llength [Query! printer $explicitPrinter is a thermal strip printer]] > 0} {
+        Notify: print program $id on thermal strip printer $explicitPrinter with code $code
+        return
+    }
+
     ForEach! printer /printer/ is a receipt printer &\
              printer /printer/ is the default printer {
         Notify: print program $id on receipt printer $printer with code $code
         return
+    }
+
+    # If the default (networked) printer is not answering, print a
+    # thermal strip instead of queueing a sheet that will never come
+    # out. Strips are rendered by print/strip.folk.
+    ForEach! printer /thermalPrinter/ is a thermal strip printer {
+        set defaultPrinter [QueryOne! printer /./ is the default printer -default ""]
+        if {$explicitPrinter eq "" && \
+            ($defaultPrinter eq "" || ![printerIsReachable $defaultPrinter])} {
+            puts "print: $defaultPrinter unreachable; using strip printer $thermalPrinter"
+            Notify: print program $id on thermal strip printer $thermalPrinter with code $code
+            return
+        }
     }
 
     set calibScaleResults [Query! the calibrated print scale is /scale/]

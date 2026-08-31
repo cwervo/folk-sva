@@ -1,0 +1,59 @@
+# HTTP route: what printers exist, and which are actually attached
+# right now.
+#
+# The /new UI uses this to fill its printer picker and to preselect
+# whatever is currently plugged in or on the network -- most people
+# reach that page from a phone and should not have to know which
+# printer happens to be alive today.
+#
+# "Attached" means different things per transport, so we test each:
+#   usb://  -- the kernel still shows a printer-class USB interface
+#   ipp://  -- the IPP port answers a bounded TCP connect
+# A CUPS queue reports "idle" either way, so neither can be inferred
+# from lpstat's state alone.
+
+Wish the web server handles route "/printers" with handler {
+    set defaultPrinter ""
+    catch {set defaultPrinter [QueryOne! printer /./ is the default printer]}
+
+    set stripPrinters [list]
+    foreach r [Query! printer /p/ is a thermal strip printer] {
+        lappend stripPrinters [dict get $r p]
+    }
+
+    # Is any printer-class USB interface present? Ask the kernel, not
+    # lpinfo: CUPS' usb backend enumerates this printer only
+    # intermittently, which is the same reason it cannot print to it.
+    set usbPrinterPresent 0
+    catch {
+        foreach f [glob -nocomplain /sys/bus/usb/devices/*/bInterfaceClass] {
+            set fp [open $f r]
+            set c [string trim [read $fp]]
+            close $fp
+            if {$c eq "07"} { set usbPrinterPresent 1; break }
+        }
+    }
+
+    set items [list]
+    catch {
+        foreach line [split [exec lpstat -v] "\n"] {
+            if {![regexp {^device for ([^:]+): (.*)$} $line -> name uri]} {
+                continue
+            }
+            set attached 0
+            if {[string match "usb://*" $uri]} {
+                set attached $usbPrinterPresent
+            } elseif {[regexp {ipps?://([0-9.]+)} $uri -> ip]} {
+                set attached [expr {![catch {
+                    exec timeout 2 bash -c "exec 3<>/dev/tcp/$ip/631"
+                }]}]
+            }
+            set kind [expr {[lsearch -exact $stripPrinters $name] >= 0 ?
+                            "strip" : "paged"}]
+            set at [expr {$attached ? "true" : "false"}]
+            lappend items "{\"name\":\"$name\",\"kind\":\"$kind\",\"attached\":$at}"
+        }
+    }
+
+    json "{\"default\":\"$defaultPrinter\",\"printers\":\[[join $items ,]\]}"
+}

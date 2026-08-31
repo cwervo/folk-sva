@@ -1,0 +1,260 @@
+# Long-strip printing, for thermal receipt printers and e-ink.
+#
+# print.folk typesets a program onto sheets of paper. This renders the
+# same program as ONE long vertical strip instead: AprilTag at the top,
+# the program's code typeset beneath it, and the page height grown to
+# fit whatever the code needs.
+#
+# Two things differ from the paged path, both because "white" on a
+# receipt or an e-ink panel means "no ink", not "white ink":
+#
+#   - Nothing is ever painted white -- not even the AprilTag's white
+#     cells. Only black is drawn. So the saved PNG has a fully
+#     transparent background, and the thermal head never burns a cell
+#     it does not need to.
+#   - Output is saved as a vertical PNG next to the PDF.
+#
+# The AprilTag is deliberately the SAME physical size in every format.
+# The vision system keys off the tag's real-world size, so it must not
+# scale with the paper.
+
+When the print library is /printLib/ &\
+     the image library is /imageLib/ &\
+     the program save directory is /saveDir/ {
+
+# Strip widths in PostScript points (1/72 inch).
+# receipt = 72mm printable on an 80mm head = 576 dots at 203dpi.
+Claim the strip formats are {
+    letter  {stripWidth 612 tagInnerSideLength 70}
+    a4      {stripWidth 595 tagInnerSideLength 70}
+    a5      {stripWidth 420 tagInnerSideLength 70}
+    receipt {stripWidth 204 tagInnerSideLength 70}
+}
+
+# 1/4 inch tall text.
+Claim the strip line height is 18
+
+# Native dot pitch of the thermal head, and its printable width in dots.
+Claim the thermal printer is 576 dots wide at 203 dpi
+
+fn tagBlackOnlyPs {id} {
+    # PostScript for tag $id drawn into the unit square, painting ONLY
+    # the black cells. White cells are left unpainted so they stay
+    # transparent in the PNG and unburned on the paper.
+    set img [$printLib tagImageForId $id]
+    set w [$imageLib Image_width $img]
+    set h [$imageLib Image_height $img]
+    set bpr [$imageLib Image_bytesPerRow $img]
+
+    set out "gsave\n0 setgray\n0 1 translate\n"
+    append out "[expr {1.0/$w}] [expr {-1.0/$h}] scale\n"
+    for {set row 0} {$row < $h} {incr row} {
+        for {set col 0} {$col < $w} {incr col} {
+            # 255 is white; anything else is a cell we must burn.
+            if {[$imageLib Image_data $img [expr {$row*$bpr + $col}]] == 255} {
+                continue
+            }
+            set c1 [expr {$col + 1}]; set r1 [expr {$row + 1}]
+            append out "newpath $col $row moveto $c1 $row lineto"
+            append out " $c1 $r1 lineto $col $r1 lineto closepath fill\n"
+        }
+    }
+    append out "grestore\n"
+    return $out
+}
+
+fn wrapCodeLines {code maxChars} {
+    # A 1/4-inch monospace glyph on a 72mm receipt only fits ~17
+    # columns, so long lines must wrap rather than run off the edge and
+    # be silently lost. Continuations are indented so the wrap is
+    # visible as a wrap.
+    if {$maxChars < 8} { set maxChars 8 }
+    set out [list]
+    foreach line [split $code "\n"] {
+        if {[string length $line] <= $maxChars} {
+            lappend out $line
+            continue
+        }
+        set first 1
+        while {[string length $line] > 0} {
+            set take [expr {$first ? $maxChars : $maxChars - 2}]
+            if {$take < 1} { set take 1 }
+            set chunk [string range $line 0 [expr {$take - 1}]]
+            set line [string range $line $take end]
+            lappend out [expr {$first ? $chunk : "  $chunk"}]
+            set first 0
+        }
+    }
+    return $out
+}
+
+fn codeToStripPostScript {id code opts {geomVar {}}} {
+    set stripWidth [dict get $opts stripWidth]
+    set tagInner   [dict get $opts tagInnerSideLength]
+    set lineHeight [dict get $opts lineHeight]
+    set margin     [dict get $opts margin]
+
+    set tagOuter [expr {$tagInner * 10.0 / 6}]
+    # Same monospace advance ratio the paged pipeline uses.
+    set advance     [expr {0.5859375 * $lineHeight}]
+    set captionSize 7.0
+    set gap         [expr {$lineHeight * 0.5}]
+
+    set usableWidth [expr {$stripWidth - 2*$margin}]
+    set maxChars [expr {int($usableWidth / $advance)}]
+    set lines [wrapCodeLines $code $maxChars]
+
+    # Grow the page to fit; this is the whole point of a strip.
+    set pageHeight [expr {$margin + $tagOuter + $gap + $captionSize +
+                          $gap + [llength $lines]*$lineHeight + $margin}]
+
+    if {$geomVar ne {}} {
+        upvar $geomVar geom
+        set geom [dict create \
+            stripWidth $stripWidth pageHeight $pageHeight \
+            tagInner $tagInner tagOuter $tagOuter \
+            margin $margin lineHeight $lineHeight advance $advance]
+    }
+
+    set tagX [expr {($stripWidth - $tagOuter) / 2.0}]
+    set tagY [expr {$pageHeight - $margin - $tagOuter}]
+    set captionY [expr {$tagY - $gap - $captionSize}]
+    set codeTop  [expr {$captionY - $gap}]
+
+    set stamp [clock format [clock seconds] -format "%a, %d %b %Y, %r"]
+
+    set ps "%!PS\n"
+    append ps "<< /PageSize \[[format %.2f $stripWidth] [format %.2f $pageHeight]\] >> setpagedevice\n"
+    # No background is painted anywhere: unpainted == transparent.
+    append ps "0 setgray\n"
+
+    append ps "gsave\n"
+    append ps "[format %.3f $tagX] [format %.3f $tagY] translate\n"
+    append ps "[format %.3f $tagOuter] [format %.3f $tagOuter] scale\n"
+    append ps [tagBlackOnlyPs $id]
+    append ps "grestore\n"
+
+    append ps "/Helvetica findfont $captionSize scalefont setfont\n"
+    append ps "newpath [format %.3f $margin] [format %.3f $captionY] moveto\n"
+    append ps "($id ($stamp)) show\n"
+
+    append ps "/NeomatrixCode findfont $lineHeight scalefont setfont\n"
+    set i 0
+    foreach line $lines {
+        incr i
+        set y [expr {$codeTop - $i*$lineHeight}]
+        set esc [string map {"\\" "\\\\" ")" "\\)" "(" "\\("} $line]
+        append ps "newpath [format %.3f $margin] [format %.3f $y] moveto ($esc) show\n"
+    }
+
+    append ps "showpage\n"
+    return $ps
+}
+
+fn writeStripArtifacts {id code formatName} {
+    Expect! the strip formats are /formats/
+    Expect! the strip line height is /lineHeight/
+
+    if {![dict exists $formats $formatName]} { set formatName receipt }
+    set fmt [dict get $formats $formatName]
+
+    set opts [dict merge $fmt [dict create \
+        lineHeight $lineHeight \
+        margin 9.0]]
+
+    set base "$saveDir/$id.$formatName"
+    set ps [codeToStripPostScript $id $code $opts geom]
+
+    set fp [open "$base.ps" w]; puts $fp $ps; close $fp
+    exec ps2pdf -dPDFSETTINGS=/prepress -sFONTPATH=vendor/fonts \
+        "$base.ps" "$base.pdf"
+
+    # pngalpha only marks pixels the PostScript actually painted, and we
+    # never paint white -- so "white on the paper" comes out fully
+    # transparent, with no post-processing and no ImageMagick.
+    exec gs -q -dNOPAUSE -dBATCH -sDEVICE=pngalpha -r203 \
+        -sOutputFile=$base.png "$base.pdf"
+
+    return [list $base $geom]
+}
+Claim the strip artifact writer is [fn writeStripArtifacts]
+
+fn writeStripProgramFiles {id code geom} {
+    # A printed strip is a live program: the camera looks its tag id up
+    # on disk. Without these two files the strip is dead paper -- and
+    # nextId, which probes for $id.folk, will hand the same id to the
+    # next print, so two different pieces of paper end up wearing the
+    # same tag.
+    if {[file exists "$saveDir/$id.folk"]} {
+        error "Program $id already exists on disk. Aborting print."
+    }
+    set fp [open "$saveDir/$id.folk" w]; puts $fp $code; close $fp
+
+    set ptmm [expr {25.4 / 72.0}]
+    set stripWidth [dict get $geom stripWidth]
+    set pageHeight [dict get $geom pageHeight]
+    set tagInn [dict get $geom tagInner]
+    set tagOut [dict get $geom tagOuter]
+    set margin [dict get $geom margin]
+    set border [expr {($tagOut - $tagInn) / 2.0}]
+    set tagX [expr {($stripWidth - $tagOut) / 2.0}]
+
+    # Same semantics as the paged pipeline's meta: distances from each
+    # paper edge to the tag's inner square.
+    set gLeft   [expr {($tagX + $border) * $ptmm}]
+    set gRight  [expr {($stripWidth - $tagX - $tagOut + $border) * $ptmm}]
+    set gTop    [expr {($margin + $border) * $ptmm}]
+    set gBottom [expr {($pageHeight - $margin - $tagOut + $border) * $ptmm}]
+
+    set geomStr [format \
+        {tagSize %.4gmm left %.4gmm right %.4gmm top %.4gmm bottom %.4gmm lineHeight %.4gmm advance %.4gmm marginTop %.4gmm marginRight %.4gmm marginBottom %.4gmm marginLeft %.4gmm} \
+        [expr {$tagInn * $ptmm}] $gLeft $gRight $gTop $gBottom \
+        [expr {[dict get $geom lineHeight] * $ptmm}] \
+        [expr {[dict get $geom advance] * $ptmm}] \
+        [expr {$margin * $ptmm}] [expr {$margin * $ptmm}] \
+        [expr {$margin * $ptmm}] [expr {$margin * $ptmm}]]
+
+    set fp [open "$saveDir/$id.meta.folk" w]
+    puts $fp "Claim tag \$this has geometry \{$geomStr\}"
+    close $fp
+}
+
+fn printStripOnThermal {printer id code} {
+    lassign [writeStripArtifacts $id $code receipt] base geom
+    writeStripProgramFiles $id $code $geom
+
+    Expect! the thermal printer is /dots/ dots wide at /dpi/ dpi
+    Expect! the strip formats are /formats/
+    set stripWidth [dict get [dict get $formats receipt] stripWidth]
+
+    # Render at exactly the head's dot width so no scaling happens in
+    # the printer. pbmraw's packed 1-bit rows are already precisely the
+    # bit layout ESC/POS raster mode wants.
+    set renderDpi [expr {double($dots) * 72.0 / $stripWidth}]
+    exec gs -q -dNOPAUSE -dBATCH -sDEVICE=pbmraw \
+        -r$renderDpi -sOutputFile=$base.pbm "$base.pdf"
+
+    exec python3 lib/pbm-to-escpos.py "$base.pbm" "$base.escpos"
+
+    # Deliberately NOT `lp -d $printer -o raw`. CUPS' usb backend
+    # answers Send-Document successful-ok for this printer, dequeues the
+    # job, and never delivers a byte -- so we write to the bulk endpoint
+    # ourselves. The queue is kept only so the printer still shows up in
+    # lpstat and the /printers picker.
+    exec python3 lib/escpos-usb.py "$base.escpos"
+
+    return $base
+}
+
+# Render the strip artifacts (PS + PDF + transparent PNG) for one
+# format without printing anything. Used to produce the letter / a4 / a5
+# variants of a program that was printed as a receipt strip.
+Subscribe: write strip artifacts for program /id/ with code /code/ in format /formatName/ {
+    writeStripArtifacts $id $code $formatName
+}
+
+Subscribe: print program /id/ on thermal strip printer /printer/ with code /code/ {
+    printStripOnThermal $printer $id $code
+}
+
+}

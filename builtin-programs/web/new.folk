@@ -18,6 +18,8 @@ Wish the web server handles route "/new" with nav "<button>New program</button>"
 
         <input id="regionAngleRange" type="range" value="0" min="0" max="360" step="0.1" oninput="this.nextElementSibling.value = `angle: ${this.value}&deg;`; regionAngle = this.value; handleDrag();">
         <output>angle: 0&deg;</output>
+
+        <select id="printerSelect" title="Printer"><option value="">default printer</option></select>
       </p>
       <pre id="error"></pre>
     </div>
@@ -158,6 +160,42 @@ Wish the web server handles route "/new" with nav "<button>New program</button>"
     errorEle.innerText = errors.map(e => formatErrorInfo(e.errorInfo)).join('\n');
   });
 
+  // Fill the printer picker from /printers, and preselect whatever is
+  // actually attached right now -- most people open this page from a
+  // phone and should not have to know which printer is alive today.
+  const printerEle = document.getElementById("printerSelect");
+  async function loadPrinters() {
+    let info;
+    try {
+      info = await (await fetch('/printers')).json();
+    } catch (e) {
+      return; // leave the "default printer" option in place
+    }
+    const printers = info.printers || [];
+    if (!printers.length) return;
+
+    // Prefer the declared default, but only if it is actually attached;
+    // otherwise fall to the first attached printer.
+    const attached = printers.filter(p => p.attached);
+    const preferred =
+      attached.find(p => p.name === info.default) || attached[0];
+
+    printerEle.innerHTML = '';
+    for (const p of printers) {
+      const opt = document.createElement('option');
+      opt.value = p.name;
+      opt.textContent = p.name
+        + (p.kind === 'strip' ? ' (strip)' : '')
+        + (p.attached ? '' : ' \u2014 offline');
+      opt.disabled = !p.attached;
+      // Mark it selected as it is built: assigning .value afterwards
+      // leaves some browsers still painting the previous option.
+      if (preferred && p.name === preferred.name) opt.selected = true;
+      printerEle.appendChild(opt);
+    }
+  }
+  loadPrinters();
+
   function handleDrag() {
     let [top, left, w, h] = [ele.offsetTop, ele.offsetLeft, ele.offsetWidth, ele.offsetHeight];
     ws.hold('geom', tcl`
@@ -251,7 +289,12 @@ Wish the web server handles route "/new" with nav "<button>New program</button>"
   function handlePrint() {
     const code = document.getElementById("code").value;
     const jobid = String(Math.random());
-    ws.send(tcl`
+    const printer = printerEle.value;
+    ws.send(printer ? tcl`
+set mixins [Query! /someone/ wishes ${program} prints with mixin /mixin/]
+set mixins [lmap m $mixins {dict get $m mixin}]
+Notify: print code ${code} with mixins $mixins on printer ${printer}
+    ` : tcl`
 set mixins [Query! /someone/ wishes ${program} prints with mixin /mixin/]
 set mixins [lmap m $mixins {dict get $m mixin}]
 Notify: print code ${code} with mixins $mixins
